@@ -1,0 +1,124 @@
+#=============================================================================
+#  .gitignore —— remote_transfer.sh
+#  原则：只放行源代码、必要的配置文件、依赖清单与文档，其余一律排除。
+#=============================================================================
+
+#--------------------- 工作区 / 编辑器记忆与本地配置 ---------------------
+# WorkBuddy 工作区元数据：包含项目记忆、会话缓存、本地调试记录，属于个人工作数据
+.workbuddy/
+# AI 助手 / 编辑器各自的本地状态目录
+.claude/
+.cursor/
+.vscode/
+.idea/
+*.code-workspace
+# 编辑器临时文件与备份文件
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+#--------------------- 本地环境配置与凭据 ---------------------
+# 真实环境变量文件可能含服务器地址、SSH 密码、API Key，绝不入库
+.env
+.env.*
+!.env.example
+*.env
+# SSH 私钥、证书、known_hosts 等本地凭据
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pem
+*.key
+*.p12
+*.pfx
+known_hosts*
+# 本地覆盖配置（保留模板）
+config.local.*
+*.local.conf
+!.example.conf
+
+#--------------------- 临时文件与调试产物 ---------------------
+# 脚本运行期临时目录（本脚本也会创建 TEMPFILES/ 做测试）
+TEMPFILES/
+tmp/
+temp/
+.tmp/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.part
+*.partial
+*.crdownload
+# 调试与测试的中间输出
+*.log
+*.trace
+*.dmp
+*.core
+core
+# 传输与断点续传的残留文件
+*.rsync-partial/
+.rsync-partial/
+*.pid
+*.sock
+
+#--------------------- 日志 ---------------------
+logs/
+log/
+*.log.*
+*.out
+
+#--------------------- 缓存与构建产物 ---------------------
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+out/
+target/
+release/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.dll
+bin/
+obj/
+
+#--------------------- 系统垃圾文件 ---------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.lnk
+
+#--------------------- 归档 / 安装包（如需分发用 Release） ---------------------
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+*.deb
+*.rpm
+*.apk
+
+#--------------------- 测试与覆盖率报告 ---------------------
+coverage/
+.coverage
+*.lcov
+htmlcov/
