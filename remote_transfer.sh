@@ -3,13 +3,15 @@
 #  remote_transfer.sh —— 交互式 SSH 远端文件夹传输助手
 #
 #  功能：
-#    1. 交互式采集 SSH 地址 / 用户名 / 端口 / 密码，并逐项校验非空
-#    2. 实际建立 SSH 连接以验证密码是否正确，失败可重新输入
+#    1. 以「远端地址:远端端口」单个字段采集连接目标，按最后一个冒号切分；
+#       省略端口默认 22；IP 做格式校验（IPv4/IPv6），域名不校验
+#    2. 采集用户名与密码，实际建立 SSH 连接验证密码，失败可重新输入
 #    3. 校验本机源目录（存在 / 是目录 / 可读），循环直到有效
 #    4. 检查远端目标目录，不存在则 mkdir -p 自动创建（含多级父目录）
 #    5. rsync 传输，实时显示进度、速度与预计剩余时间
 #    6. 传输前统一询问一次「是否覆盖已存在文件」，该选择作用于本次全部传输
-#    7. 依赖自检：缺 sshpass 时尝试自动安装，装不上则降级为 OpenSSH
+#    7. 传输后询问是否执行 HASH 校验，逐文件比对 SHA-256 并展示双方汇总值
+#    8. 依赖自检：缺 sshpass 时尝试自动安装，装不上则降级为 OpenSSH
 #       自带的 SSH_ASKPASS 方案（零第三方依赖）
 #
 #  依赖：ssh（必需）；sshpass（可选，缺失时自动安装或零依赖降级）；
@@ -28,6 +30,7 @@ SSH_CONNECT_TIMEOUT=10      # 单次连接超时（秒）
 
 LOCAL_ABS=""                # 本机源目录的绝对路径
 REMOTE_DIR=""                # 远端目标目录
+FINAL_DIR=""                 # 远端最终生成的目录（REMOTE_DIR/basename）
 REPLY_VALUE=""               # ask_required 的返回值载体
 
 HAVE_RSYNC_LOCAL=0
@@ -157,6 +160,148 @@ validate_port() {
     local p=$1
     [[ $p =~ ^[0-9]{1,5}$ ]] || return 1
     (( 10#$p >= 1 && 10#$p <= 65535 ))
+}
+
+#--------------------- 地址解析与 IP 格式校验 ---------------------
+# 合法 IPv4：四段十进制、每段 0-255、禁止前导零（010 这种会被误认为八进制）
+is_valid_ipv4() {
+    local ip=$1 o
+    local -a parts
+    [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS='.' read -r -a parts <<< "$ip"
+    (( ${#parts[@]} == 4 )) || return 1
+    for o in "${parts[@]}"; do
+        (( 10#$o <= 255 )) || return 1
+        [[ ${#o} -gt 1 && $o == 0* ]] && return 1
+    done
+    return 0
+}
+
+# 统计 IPv6 文本里占几个 16 位分组（内嵌 IPv4 记 2 组）；失败返回 1
+_ipv6_group_count() {
+    local s=$1 n=0 g
+    if [[ $s == *.* ]]; then
+        is_valid_ipv4 "${s##*:}" || return 1
+        case $s in
+            *:*) s=${s%:*} ;;
+            *)   s="" ;;
+        esac
+        n=2
+        [[ -z $s ]] && { printf '%d' "$n"; return 0; }
+    fi
+    local IFS=':'
+    for g in $s; do
+        [[ $g =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        n=$((n + 1))
+    done
+    printf '%d' "$n"
+}
+
+# 合法 IPv6：支持 :: 压缩（只能出现一次）、内嵌 IPv4、zone id（%eth0）
+is_valid_ipv6() {
+    local ip=$1 left right ln rn
+    ip=${ip%%\%*}
+    [[ $ip == *:* ]] || return 1
+    [[ $ip =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    case $ip in
+        *::*)
+            [[ ${ip#*::} == *::* ]] && return 1        # :: 出现两次即非法
+            left=${ip%%::*}; right=${ip#*::}
+            ln=$(_ipv6_group_count "$left") || return 1
+            rn=$(_ipv6_group_count "$right") || return 1
+            (( ln + rn < 8 ))
+            return
+            ;;
+        *)
+            ln=$(_ipv6_group_count "$ip") || return 1
+            (( ln == 8 ))
+            return
+            ;;
+    esac
+}
+
+# 解析「远端地址:远端端口」——成功返回 0，结果写入 HOST_PART / PORT_PART，
+# 必要时用 PARSE_NOTE 说明补全行为；失败返回 1，原因写入 PARSE_ERR。
+#
+# 解析规则（与 scp/rsync 的 host:path 习惯一致，尽量符合直觉）：
+#   1. [IPv6]:端口 / [IPv6]  → 方括号内是地址，方括号后的 :端口 可选
+#   2. 裸 IPv6（冒号多于 1 个且无方括号）→ 整体视为地址，端口默认 22
+#   3. 只有一个冒号 → 按该冒号切分，左边地址、右边端口
+#   4. 完全没有冒号 → 整体是地址，端口默认 22
+#   5. 有冒号但冒号后面为空（如 1.2.3.4:）→ 视为格式错误
+HOST_PART=""; PORT_PART=""; PARSE_ERR=""; PARSE_NOTE=""
+
+parse_endpoint() {
+    local s=$1 host="" port="" rest="" ncolon
+
+    if [[ $s == \[* ]]; then
+        [[ $s == *\]* ]] || { PARSE_ERR="方括号没有闭合，IPv6 应写成 [2001:db8::1]:22"; return 1; }
+        host=${s#\[}; host=${host%%\]*}
+        rest=${s#*\]}
+        case $rest in
+            "")  port="" ;;
+            :*)  port=${rest#:} ;;
+            *)   PARSE_ERR="方括号后面只能跟「:端口」，您输入的是「$rest」"; return 1 ;;
+        esac
+    else
+        ncolon=${s//[^:]/}
+        if (( ${#ncolon} > 1 )); then
+            host=$s; port=""                     # 裸 IPv6，不含端口
+        elif (( ${#ncolon} == 1 )); then
+            host=${s%%:*}; port=${s##*:}         # 按最后一个（此处唯一一个）冒号切分
+        else
+            host=$s; port=""
+        fi
+    fi
+
+    PARSE_NOTE=""
+    if [[ -z $host ]]; then
+        PARSE_ERR="冒号前面缺少服务器地址（正确写法如 192.168.1.10:22）"
+        return 1
+    fi
+
+    if [[ -z $port ]]; then
+        if [[ $s == *: ]]; then
+            PARSE_ERR="冒号后面缺少端口号。不想指定端口请直接省略冒号，例如 192.168.1.10"
+            return 1
+        fi
+        port=22
+        if [[ $host == *:* ]]; then
+            PARSE_NOTE="识别为 IPv6 地址且未指定端口，按默认 22 处理。若需指定端口请写成 [地址]:端口"
+        else
+            PARSE_NOTE="未填写端口，按默认 22 处理。"
+        fi
+    fi
+
+    if ! [[ $port =~ ^[0-9]{1,5}$ ]]; then
+        PARSE_ERR="端口「$port」不是数字，端口必须是 1-65535 之间的整数"
+        return 1
+    fi
+    if (( 10#$port < 1 || 10#$port > 65535 )); then
+        PARSE_ERR="端口 $port 超出范围，必须在 1-65535 之间"
+        return 1
+    fi
+    port=$((10#$port))          # 去掉前导零，避免 ssh -p 0022 被判为非法端口
+
+    # 地址部分：像 IP 就严格校验，否则按域名处理（域名不做格式校验）
+    if [[ $host == *:* ]]; then
+        if ! is_valid_ipv6 "$host"; then
+            PARSE_ERR="「$host」不是合法的 IPv6 地址（IPv6 带端口请写成 [2001:db8::1]:22）"
+            return 1
+        fi
+    elif [[ $host =~ ^[0-9.]+$ ]]; then
+        if ! is_valid_ipv4 "$host"; then
+            PARSE_ERR="「$host」不是合法的 IPv4 地址（需四段 0-255，且不能有前导零）"
+            return 1
+        fi
+    elif [[ $host == *[[:space:]]* || $host == */* || $host == *@* ]]; then
+        PARSE_ERR="地址「$host」含非法字符（空格、/、@ 都不允许，请只填主机名）"
+        return 1
+    fi
+
+    HOST_PART=$host
+    PORT_PART=$port
+    return 0
 }
 
 #--------------------- 依赖检测与自动安装 ---------------------
@@ -395,22 +540,35 @@ diagnose_ssh_error() {
 
 #--------------------- 第一步：采集连接信息 ---------------------
 collect_ssh_info() {
-    printf '\n%s---- 第 1 步：SSH 连接信息 ----%s\n' "$C_BLD" "$C_RST"
+    local raw
 
-    ask_required "远端服务器地址（IP 或域名）: "
-    SSH_HOST=$REPLY_VALUE
+    printf '\n%s---- 第 1 步：SSH 连接信息 ----%s\n' "$C_BLD" "$C_RST"
+    printf '  输入格式：地址:端口\n'
+    printf '    例：192.168.1.10:22    example.com:2222    example.com    [2001:db8::1]:22\n'
+    printf '  省略端口时默认使用 22；IPv4/IPv6 会做格式校验，域名不做校验。\n'
+
+    while :; do
+        IFS= read -r -p "远端地址:端口 : " raw || { printf '\n'; err "输入已结束，退出。"; exit 1; }
+        raw=$(strip_quotes "$(trim "$raw")")
+
+        if [[ -z $raw ]]; then
+            err "输入不能为空，请按「地址:端口」的格式重新输入。"
+            continue
+        fi
+        # 立即校验：格式不通过就不往下走，也不发起任何网络连接
+        if ! parse_endpoint "$raw"; then
+            err "格式错误：$PARSE_ERR"
+            continue
+        fi
+        SSH_HOST=$HOST_PART
+        SSH_PORT=$PORT_PART
+        [[ -n $PARSE_NOTE ]] && info "$PARSE_NOTE"
+        ok "远端地址：${SSH_HOST}（端口 ${SSH_PORT}）"
+        break
+    done
 
     ask_required "SSH 用户名: "
     SSH_USER=$REPLY_VALUE
-
-    while :; do
-        ask_required "SSH 端口（1-65535，默认端口请填 22）: "
-        if validate_port "$REPLY_VALUE"; then
-            SSH_PORT=$REPLY_VALUE
-            break
-        fi
-        err "端口必须是 1-65535 之间的数字，您输入的是：$REPLY_VALUE"
-    done
 
     while :; do
         IFS= read -r -s -p "SSH 密码（输入时不回显）: " SSH_PASS || { printf '\n'; err "输入已结束，退出。"; exit 1; }
@@ -666,6 +824,7 @@ do_transfer() {
     local base dest_path dest ssh_e rc rsync_opts
 
     base=$(basename -- "$LOCAL_ABS")
+    FINAL_DIR=$(join_path "$REMOTE_DIR" "$base")
     if [[ $REMOTE_DIR == "/" ]]; then
         dest_path="/"
     else
@@ -677,7 +836,7 @@ do_transfer() {
     printf '\n%s---- 第 4 步：开始传输 ----%s\n' "$C_BLD" "$C_RST"
     info "本机源目录 : $LOCAL_ABS"
     info "远端目标   : ${SSH_USER}@${SSH_HOST}:${REMOTE_DIR}"
-    info "传输后将生成：$(join_path "$REMOTE_DIR" "$base")"
+    info "传输后将生成：$FINAL_DIR"
     if (( OVERWRITE == 1 )); then
         info "覆盖策略   : 覆盖远端同名文件"
     else
@@ -738,24 +897,60 @@ do_transfer() {
 
 #--------------------- 收尾汇总 ---------------------
 print_summary() {
-    local final fb64 remote_size
-    final=$(join_path "$REMOTE_DIR" "$(basename -- "$LOCAL_ABS")")
-    fb64=$(to_b64 "$final")
+    local remote_size fb64
+    [[ -z $FINAL_DIR ]] && FINAL_DIR=$(join_path "$REMOTE_DIR" "$(basename -- "$LOCAL_ABS")")
+    fb64=$(to_b64 "$FINAL_DIR")
 
     remote_size=$(ssh_exec "d=\$(printf '%s' '$fb64' | base64 -d) || exit 9
 if [ -d \"\$d\" ]; then du -sh -- \"\$d\" 2>/dev/null | cut -f1; else echo '__MISSING__'; fi")
 
     printf '\n%s==============================================================%s\n' "$C_BLD" "$C_RST"
-    ok "全部完成"
+    if [[ $HASH_STATUS == "DIFF" ]]; then
+        err "传输已完成，但源与目标的 HASH 不一致，请核对上方差异明细。"
+    elif [[ $HASH_STATUS == "ERROR" ]]; then
+        warn "传输已完成，但 HASH 校验未能完成。"
+    else
+        ok "全部完成"
+    fi
     printf '  本机源目录 ：%s\n' "$LOCAL_ABS"
     printf '  远端主机   ：%s@%s（端口 %s）\n' "$SSH_USER" "$SSH_HOST" "$SSH_PORT"
     printf '  远端目标   ：%s\n' "$REMOTE_DIR"
-    printf '  最终路径   ：%s\n' "$final"
+    printf '  最终路径   ：%s\n' "$FINAL_DIR"
     if [[ $remote_size == *__MISSING__* || -z $remote_size ]]; then
         warn "远端未查询到该目录，请手工确认。"
     else
         printf '  远端占用   ：%s\n' "$remote_size"
     fi
+
+    case $HASH_STATUS in
+        SAME)
+            printf '  HASH 校验  ：%s一致%s（本机 %d 个文件 / 远端 %d 个文件）\n' \
+                "$C_GRN" "$C_RST" "$HASH_COUNT_LOCAL" "$HASH_COUNT_REMOTE"
+            printf '    本机 SHA-256：%s\n' "$HASH_LOCAL"
+            printf '    远端 SHA-256：%s\n' "$HASH_REMOTE"
+            printf '    （汇总值 = 全部文件「相对路径 + 内容 SHA-256」清单的 SHA-256）\n'
+            ;;
+        DIFF)
+            printf '  HASH 校验  ：%s不一致%s（本机 %d 个文件 / 远端 %d 个文件）\n' \
+                "$C_RED" "$C_RST" "$HASH_COUNT_LOCAL" "$HASH_COUNT_REMOTE"
+            printf '    本机 SHA-256：%s\n' "$HASH_LOCAL"
+            printf '    远端 SHA-256：%s\n' "$HASH_REMOTE"
+            if [[ -n $HASH_DIFF ]]; then
+                printf '    差异明细（< 本机侧 / > 远端侧；内容不同时两侧各列一行）：\n'
+                printf '%s\n' "$HASH_DIFF" | sed 's/^/      /'
+            fi
+            if (( OVERWRITE == 0 )); then
+                warn "本次选择了「不覆盖」：远端已有同名文件保留旧内容，HASH 差异可能由此产生。"
+            fi
+            ;;
+        SKIPPED)
+            printf '  HASH 校验  ：已跳过（未执行）\n'
+            ;;
+        *)
+            printf '  HASH 校验  ：未能完成\n'
+            [[ -n $HASH_MSG ]] && printf '    原因：%s\n' "$HASH_MSG"
+            ;;
+    esac
     printf '%s==============================================================%s\n' "$C_BLD" "$C_RST"
 }
 
@@ -787,6 +982,152 @@ ask_overwrite() {
     done
 }
 
+#--------------------- 第五步：HASH 校验 ---------------------
+# 逐文件比对 SHA-256 清单；只比内容，不比权限 / 属主 / 时间戳 / 空目录
+HASH_STATUS="SKIPPED"       # SKIPPED 跳过 / SAME 一致 / DIFF 不一致 / ERROR 未完成
+HASH_LOCAL=""
+HASH_REMOTE=""
+HASH_COUNT_LOCAL=0
+HASH_COUNT_REMOTE=0
+HASH_DIFF=""
+HASH_MSG=""
+
+# 本机是否有可用的 SHA-256 工具
+have_local_hash_cmd() {
+    command -v sha256sum >/dev/null 2>&1 ||
+    command -v shasum    >/dev/null 2>&1 ||
+    command -v openssl   >/dev/null 2>&1
+}
+
+# 本机单文件 SHA-256（sha256sum → shasum -a 256 → openssl dgst）
+hash_file_local() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+    else
+        openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+    fi
+}
+
+# 对标准输入求 SHA-256
+hash_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    else
+        openssl dgst -sha256 | awk '{print $NF}'
+    fi
+}
+
+# 生成「哈希  相对路径」清单（按路径排序，保证两侧可比）
+local_manifest() {
+    local f h
+    (
+        cd -- "$LOCAL_ABS" 2>/dev/null || exit 1
+        # 用 ./ 前缀遍历，避免文件名以 - 开头被当成参数
+        find . -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+            h=$(hash_file_local "$f") || exit 1
+            printf '%s  %s\n' "$h" "${f#./}"
+        done
+    ) | LC_ALL=C sort -k2
+}
+
+# 在远端生成同样的清单；路径经 base64 传递，避免二次解释
+remote_manifest() {
+    local b64
+    b64=$(to_b64 "$FINAL_DIR")
+    ssh_exec "B64='$b64'
+d=\$(printf '%s' \"\$B64\" | base64 -d) || { echo __BADB64__; exit 9; }
+cd -- \"\$d\" 2>/dev/null || { echo __NODIR__; exit 8; }
+if   command -v sha256sum >/dev/null 2>&1; then HM=sum
+elif command -v shasum    >/dev/null 2>&1; then HM=shasum
+elif command -v openssl   >/dev/null 2>&1; then HM=openssl
+else echo __NOHASH__; exit 7; fi
+find . -type f -print0 | while IFS= read -r -d '' f; do
+    case \$HM in
+        sum)     h=\$(sha256sum \"\$f\" | cut -d' ' -f1) ;;
+        shasum)  h=\$(shasum -a 256 \"\$f\" | cut -d' ' -f1) ;;
+        openssl) h=\$(openssl dgst -sha256 \"\$f\" | awk '{print \$NF}') ;;
+    esac
+    printf '%s  %s\n' \"\$h\" \"\${f#./}\"
+done | LC_ALL=C sort -k2"
+}
+
+do_hash_verify() {
+    local lm rm
+
+    if ! have_local_hash_cmd; then
+        HASH_STATUS="ERROR"
+        HASH_MSG="本机没有 sha256sum / shasum / openssl，无法计算 HASH。"
+        err "$HASH_MSG"
+        return 0
+    fi
+
+    info "正在计算本机源目录的 HASH ……"
+    lm=$(local_manifest)
+    if [[ -z $lm ]]; then
+        HASH_STATUS="ERROR"
+        HASH_MSG="本机源目录内没有普通文件（空目录无法比对）。"
+        err "$HASH_MSG"
+        return 0
+    fi
+
+    info "正在计算远端目标目录的 HASH ……"
+    rm=$(remote_manifest)
+    case $rm in
+        *__NOHASH__*)
+            HASH_STATUS="ERROR"
+            HASH_MSG="远端缺少 sha256sum / shasum / openssl，无法计算 HASH。"
+            err "$HASH_MSG"; return 0 ;;
+        *__NODIR__*)
+            HASH_STATUS="ERROR"
+            HASH_MSG="远端目标目录不存在或无法进入：$FINAL_DIR"
+            err "$HASH_MSG"; return 0 ;;
+        *__BADB64__*)
+            HASH_STATUS="ERROR"
+            HASH_MSG="远端缺少 base64，无法安全传递目录名。"
+            err "$HASH_MSG"; return 0 ;;
+    esac
+    if [[ -z $rm ]]; then
+        HASH_STATUS="ERROR"
+        HASH_MSG="远端目标目录内没有普通文件。"
+        err "$HASH_MSG"
+        return 0
+    fi
+
+    HASH_COUNT_LOCAL=$(printf '%s\n' "$lm" | grep -c .)
+    HASH_COUNT_REMOTE=$(printf '%s\n' "$rm" | grep -c .)
+    HASH_LOCAL=$(printf '%s\n' "$lm" | hash_stream)
+    HASH_REMOTE=$(printf '%s\n' "$rm" | hash_stream)
+
+    if [[ $HASH_LOCAL == "$HASH_REMOTE" ]]; then
+        HASH_STATUS="SAME"
+    else
+        HASH_STATUS="DIFF"
+        HASH_DIFF=$(diff <(printf '%s\n' "$lm") <(printf '%s\n' "$rm") 2>/dev/null | head -n 30)
+    fi
+    return 0
+}
+
+ask_hash_verify() {
+    local ans
+    printf '\n%s---- 第 5 步：HASH 校验 ----%s\n' "$C_BLD" "$C_RST"
+    printf '  将对源目录与远端目标目录中的每个文件计算 SHA-256 并逐一比对；\n'
+    printf '  只比对文件内容，不比对权限、属主、时间戳与空目录。\n'
+    while :; do
+        IFS= read -r -p "是否执行 HASH 校验？[Y=执行 / n=跳过]: " ans ||
+            { printf '\n'; HASH_STATUS="SKIPPED"; return 0; }
+        ans=$(trim "$ans")
+        case $ans in
+            ""|y|Y) do_hash_verify; return 0 ;;
+            n|N)    HASH_STATUS="SKIPPED"; info "已跳过 HASH 校验。"; return 0 ;;
+            *)      err "无效输入「$ans」：请输入 y 执行校验，或 n 跳过（直接回车默认执行）。" ;;
+        esac
+    done
+}
+
 #--------------------- 主流程 ---------------------
 main() {
     print_banner
@@ -796,7 +1137,16 @@ main() {
     choose_remote_dir || exit 1
     ask_overwrite
     do_transfer
+    ask_hash_verify
     print_summary
+    # HASH 不一致视为校验失败：汇总已打印，用独立退出码告知调用者
+    if [[ $HASH_STATUS == "DIFF" ]]; then
+        exit 2
+    fi
+    return 0
 }
 
-main "$@"
+# 只在直接执行时进入主流程；被 source 时仅加载函数，便于单元测试
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
