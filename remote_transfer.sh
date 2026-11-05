@@ -5,19 +5,23 @@
 #  功能：
 #    1. 以「远端地址:远端端口」单个字段采集连接目标，按最后一个冒号切分；
 #       省略端口默认 22；IP 做格式校验（IPv4/IPv6），域名不校验
-#    2. 采集用户名与密码，实际建立 SSH 连接验证密码，失败可重新输入
-#    3. 校验本机源目录（存在 / 是目录 / 可读），循环直到有效
-#    4. 检查远端目标目录，不存在则 mkdir -p 自动创建（含多级父目录）
-#    5. rsync 传输，实时显示进度、速度与预计剩余时间
-#    6. 传输前统一询问一次「是否覆盖已存在文件」，该选择作用于本次全部传输
-#    7. 传输后询问是否执行 HASH 校验，逐文件比对 SHA-256 并展示双方汇总值
-#    8. 依赖自检：缺 sshpass 时尝试自动安装，装不上则降级为 OpenSSH
+#    2. 首次连接先展示主机密钥指纹并请用户确认，确认前不发送任何凭证
+#    3. 优先尝试公钥 / ssh-agent 免密登录，不可用时才采集密码并验证
+#    4. 校验本机源目录（存在 / 是目录 / 可读），循环直到有效
+#    5. 检查远端目标目录，不存在则 mkdir -p 自动创建（含多级父目录）
+#    6. rsync 传输，实时显示进度、速度与预计剩余时间
+#    7. 传输前统一询问一次「是否覆盖已存在文件」，该选择作用于本次全部传输
+#    8. 传输后询问是否执行 HASH 校验，逐文件比对 SHA-256 并展示双方汇总值
+#    9. 依赖自检：缺 sshpass 时尝试自动安装，装不上则降级为 OpenSSH
 #       自带的 SSH_ASKPASS 方案（零第三方依赖）
 #
 #  依赖：ssh（必需）；sshpass（可选，缺失时自动安装或零依赖降级）；
 #        rsync / pv（可选，仅影响速度与剩余时间的显示效果）
 #
 #  用法： bash remote_transfer.sh
+#
+#  退出码：0 成功 / 1 失败或中断 / 2 传输成功但 HASH 不一致 /
+#          3 传输成功但 HASH 校验未能完成
 #=====================================================================
 set -uo pipefail
 
@@ -27,6 +31,15 @@ SSH_USER=""
 SSH_PORT=""
 SSH_PASS=""
 SSH_CONNECT_TIMEOUT=10      # 单次连接超时（秒）
+
+# 认证方式：1 = 公钥 / ssh-agent 免密（不采集密码），0 = 密码
+USE_KEY_AUTH=0
+# 主机密钥策略：确认指纹前不连接；确认后固定为 yes（密钥变更即拒绝）
+SSH_HOSTKEY_OPT=""
+KNOWN_HOSTS="${HOME}/.ssh/known_hosts"
+# 认证相关选项（随 USE_KEY_AUTH 变化，由 refresh_auth_opts 维护）
+SSH_AUTH_OPTS=(-o PreferredAuthentications=password,keyboard-interactive
+               -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1)
 
 LOCAL_ABS=""                # 本机源目录的绝对路径
 REMOTE_DIR=""                # 远端目标目录
@@ -48,15 +61,32 @@ SETSID_FLAG=""
 # 覆盖策略：1 = 覆盖同名文件，0 = 跳过已存在文件（一次询问，作用于全部传输）
 OVERWRITE=1
 
-TMP_ERR="$(mktemp "${TMPDIR:-/tmp}/rtransfer.XXXXXX" 2>/dev/null)" || {
-    printf '无法创建临时文件，脚本退出。\n' >&2
+# 本机可用的 SHA-256 工具，启动时探测一次（避免每文件重复 command -v）
+HASHER_LOCAL=""
+
+# tar 管道各环节退出码快照，失败时用于说明是哪一环出的问题
+TAR_RC_DETAIL=""
+
+# 全部临时产物集中在一个 700 目录里，退出时整体清理
+# TMPDIR 在 Git Bash / Cygwin 下常是 C:\Users\...\Temp 这类混合路径，
+# 先统一成 POSIX 形式，免得 mktemp / rm / [[ -d ]] 的行为随实现而变化
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE//\\//}"
+[[ -d $TMP_BASE ]] || TMP_BASE=/tmp
+TMP_ROOT="$(mktemp -d "$TMP_BASE/rtransfer.XXXXXX" 2>/dev/null)" || {
+    printf '无法创建临时目录，脚本退出。\n' >&2
     exit 1
 }
+TMP_ERR="$TMP_ROOT/ssh.err"
+TMP_MAN_L="$TMP_ROOT/local.sha256"
+TMP_MAN_R="$TMP_ROOT/remote.sha256"
+: > "$TMP_ERR" 2>/dev/null || true
 
 #--------------------- 清理与信号 ---------------------
 cleanup() {
+    # 脚本内保存的密码必须一并清掉（被 source 时不会污染调用者 shell）
+    SSH_PASS=""
     unset SSHPASS RTRANSFER_SSH_PASS 2>/dev/null || true
-    [[ -n "${TMP_ERR:-}" && -f "$TMP_ERR" ]] && rm -f -- "$TMP_ERR"
     # askpass 辅助脚本里不含密码，只做删除；失败也不影响退出
     if [[ -n "${ASKPASS_FILE:-}" && -f "$ASKPASS_FILE" ]]; then
         : > "$ASKPASS_FILE" 2>/dev/null
@@ -64,6 +94,10 @@ cleanup() {
         if [[ -n "${ASKPASS_DIR:-}" && -d "$ASKPASS_DIR" ]]; then
             rmdir -- "$ASKPASS_DIR" 2>/dev/null || true
         fi
+    fi
+    # 只删自己 mktemp 出来的目录，避免误删
+    if [[ -n "${TMP_ROOT:-}" && -d "$TMP_ROOT" && $TMP_ROOT == */rtransfer.* ]]; then
+        rm -rf -- "$TMP_ROOT" 2>/dev/null || true
     fi
     return 0
 }
@@ -119,6 +153,20 @@ strip_quotes() {
     printf '%s' "$s"
 }
 
+# 汇总一组退出码：返回其中第一个非零值（全为 0 则返回 0）
+# 管道里任何一环失败都算失败，避免只看最后一环造成「假成功」
+worst_rc() {
+    local s
+    for s in "$@"; do
+        [[ $s =~ ^[0-9]+$ ]] || continue
+        if (( s != 0 )); then
+            printf '%d' "$s"
+            return 0
+        fi
+    done
+    printf '0'
+}
+
 # 拼接远端路径，避免出现 // 或多余斜杠
 join_path() {
     if [[ $1 == "/" ]]; then
@@ -154,12 +202,6 @@ ask_required() {
         REPLY_VALUE=$value
         return 0
     done
-}
-
-validate_port() {
-    local p=$1
-    [[ $p =~ ^[0-9]{1,5}$ ]] || return 1
-    (( 10#$p >= 1 && 10#$p <= 65535 ))
 }
 
 #--------------------- 地址解析与 IP 格式校验 ---------------------
@@ -333,13 +375,57 @@ can_escalate() {
     (( EUID == 0 )) || command -v sudo >/dev/null 2>&1
 }
 
+# 装包命令的展示文本（只用于提示，不参与执行）
+install_cmd_text() {
+    local pm=$1 pkg=$2
+    case $pm in
+        apt-get) printf 'apt-get update -qq && apt-get install -y %s' "$pkg" ;;
+        dnf)     printf 'dnf install -y %s' "$pkg" ;;
+        yum)     printf 'yum install -y %s' "$pkg" ;;
+        zypper)  printf 'zypper --non-interactive install %s' "$pkg" ;;
+        pacman)  printf 'pacman -S --noconfirm %s' "$pkg" ;;
+        apk)     printf 'apk add --no-cache %s' "$pkg" ;;
+        *)       printf '安装 %s' "$pkg" ;;
+    esac
+}
+
+APT_INDEX_UPDATED=0
+
+# 安装软件包。$1 = 包名；$2 = yes 表示调用方已取得用户同意（不再二次确认）
 install_package() {
-    local pkg=$1 pm
+    local pkg=$1 assume=${2:-no} pm cmd ans
     pm=$(detect_pm) || { err "未识别到可用的包管理器，无法自动安装 $pkg。"; return 1; }
+    cmd=$(install_cmd_text "$pm" "$pkg")
+
+    if [[ $assume != yes ]]; then
+        if (( EUID == 0 )); then
+            printf '  即将以 root 身份执行：%s\n' "$cmd" >&2
+        elif command -v sudo >/dev/null 2>&1; then
+            printf '  即将以 sudo 执行：%s\n' "$cmd" >&2
+        else
+            err "缺少 root 权限且没有 sudo，无法自动安装 $pkg。"
+            return 1
+        fi
+        # read -p 的提示走 stderr，stdout 被重定向时仍然可见
+        IFS= read -r -p "  是否继续？[y=安装 / n=跳过]: " ans || ans=n
+        case $ans in
+            y|Y) ;;
+            *) info "已跳过安装 $pkg。"; return 1 ;;
+        esac
+    fi
 
     info "正在通过 $pm 安装 $pkg ……"
+    if [[ $pm == apt-get ]] && (( APT_INDEX_UPDATED == 0 )); then
+        # 新容器或索引过旧时不 update 必然报 "Unable to locate package"
+        info "先刷新软件包索引（apt-get update）……"
+        as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq || \
+            warn "apt-get update 未成功，仍尝试安装。"
+        APT_INDEX_UPDATED=1
+    fi
+
     case $pm in
-        apt-get) DEBIAN_FRONTEND=noninteractive as_root apt-get install -y "$pkg" ;;
+        # DEBIAN_FRONTEND 必须经 env 传给 sudo 之后的那条命令，写在函数前面对 sudo 无效
+        apt-get) as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" ;;
         dnf)     as_root dnf install -y "$pkg" ;;
         yum)     as_root yum install -y "$pkg" ;;
         zypper)  as_root zypper --non-interactive install "$pkg" ;;
@@ -363,7 +449,7 @@ ssh_supports_askpass_require() {
 
 # 准备零依赖的密码注入：写一个只回显环境变量的 askpass 小脚本（脚本本身不含密码）
 setup_askpass() {
-    ASKPASS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rtransfer.askpass.XXXXXX" 2>/dev/null) || return 1
+    ASKPASS_DIR=$(mktemp -d "$TMP_BASE/rtransfer.askpass.XXXXXX" 2>/dev/null) || return 1
     ASKPASS_FILE="$ASKPASS_DIR/askpass.sh"
     cat > "$ASKPASS_FILE" <<'ASKPASS_EOF'
 #!/bin/sh
@@ -398,7 +484,10 @@ ASKPASS_EOF
 }
 
 # 选定密码注入后端：sshpass 优先，缺失时自动安装，装不上则零依赖降级
+# 只在确实需要密码认证时调用（密钥可用时完全不需要准备后端）
 ensure_auth_backend() {
+    [[ -n $AUTH_BACKEND ]] && return 0
+
     if command -v sshpass >/dev/null 2>&1; then
         AUTH_BACKEND="sshpass"
         return 0
@@ -413,7 +502,8 @@ ensure_auth_backend() {
     fi
 
     if [[ ${ans:-Y} == [yY] ]]; then
-        if install_package sshpass && command -v sshpass >/dev/null 2>&1; then
+        # 这里已经问过一次，装包不再重复确认
+        if install_package sshpass yes && command -v sshpass >/dev/null 2>&1; then
             AUTH_BACKEND="sshpass"
             ok "sshpass 安装成功。"
             return 0
@@ -441,7 +531,7 @@ ensure_deps() {
             apt-get) pkg="openssh-client" ;;
             dnf|yum|zypper) pkg="openssh-clients" ;;
         esac
-        install_package "$pkg" >/dev/null 2>&1 || true
+        install_package "$pkg" >/dev/null || true
         command -v ssh >/dev/null 2>&1 || {
             err "无法自动安装 ssh 客户端。请手动安装后重试："
             err "  Debian/Ubuntu: sudo apt-get install -y openssh-client"
@@ -452,10 +542,22 @@ ensure_deps() {
         ok "ssh 客户端已就绪。"
     fi
 
-    # 2) 密码注入后端（sshpass 或零依赖 askpass）
-    ensure_auth_backend
+    # 2) base64：远端路径全部经它编码后传递，本机缺失会让每条远端命令都拿到空路径，
+    #    症状看起来像「远端缺 base64」，实际是本机的问题，所以在这里就拦住
+    if ! command -v base64 >/dev/null 2>&1; then
+        err "本机缺少 base64 命令，无法安全地把路径传给远端。"
+        err "  Debian/Ubuntu: sudo apt-get install -y coreutils"
+        err "  macOS 自带；其他发行版请安装 coreutils"
+        exit 1
+    fi
 
-    # 3) 可选工具，只检测不安装：只影响进度显示效果，不影响功能
+    # 3) 本机 HASH 工具：只探测一次，后续不再每文件 command -v
+    detect_local_hasher || true
+
+    # 4) 密码注入后端（sshpass 或零依赖 askpass）不在这里准备：
+    #    先尝试密钥免密登录，确实需要密码时才初始化，避免多余装包
+
+    # 5) 可选工具，只检测不安装：只影响进度显示效果，不影响功能
     command -v rsync >/dev/null 2>&1 && HAVE_RSYNC_LOCAL=1
     command -v pv    >/dev/null 2>&1 && HAVE_PV=1
 
@@ -471,9 +573,24 @@ ensure_deps() {
 }
 
 #--------------------- SSH 相关封装 ---------------------
+# 认证选项随认证方式变化：密钥可用时不再强制密码，反之禁用公钥以免反复弹密钥
+refresh_auth_opts() {
+    if (( USE_KEY_AUTH == 1 )); then
+        SSH_AUTH_OPTS=(-o BatchMode=yes -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0)
+    else
+        SSH_AUTH_OPTS=(-o PreferredAuthentications=password,keyboard-interactive
+                       -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1)
+    fi
+}
+
 # 统一的「带密码执行」封装：对外仍是 ssh/scp/rsync 的原始参数，
 # 内部按当前后端决定注入方式，调用处无需关心用的是 sshpass 还是 askpass。
 pw_run() {
+    # 密钥认证：不需要任何密码注入，直接执行
+    if (( USE_KEY_AUTH == 1 )); then
+        "$@"
+        return
+    fi
     case $AUTH_BACKEND in
         sshpass)
             SSHPASS=$SSH_PASS sshpass -e "$@"
@@ -499,18 +616,92 @@ pw_run() {
 }
 
 # 执行一条远端命令；stdout 返回给调用者，stderr 收进 $TMP_ERR
+# 每次调用先清空 $TMP_ERR，避免多轮重试后错误日志无限增长、互相污染
 ssh_exec() {
+    : > "$TMP_ERR" 2>/dev/null
     pw_run ssh \
         -p "$SSH_PORT" \
-        -o StrictHostKeyChecking=accept-new \
+        -o "StrictHostKeyChecking=${SSH_HOSTKEY_OPT:-accept-new}" \
         -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
-        -o NumberOfPasswordPrompts=1 \
-        -o PreferredAuthentications=password,keyboard-interactive \
-        -o PubkeyAuthentication=no \
         -o LogLevel=ERROR \
+        "${SSH_AUTH_OPTS[@]}" \
         -- "${SSH_USER}@${SSH_HOST}" "$1" 2>>"$TMP_ERR"
+}
+
+#--------------------- 主机密钥校验 ---------------------
+# 首次连接必须由用户确认指纹后才继续，确认前不发送任何凭证。
+# 已存在于 known_hosts 时用 yes（密钥变更即拒绝），而不是 accept-new 静默信任。
+host_entry_name() {
+    if (( SSH_PORT == 22 )); then
+        printf '%s' "$SSH_HOST"
+    else
+        printf '[%s]:%s' "$SSH_HOST" "$SSH_PORT"
+    fi
+}
+
+host_key_known() {
+    command -v ssh-keygen >/dev/null 2>&1 || return 1
+    [[ -f $KNOWN_HOSTS ]] || return 1
+    ssh-keygen -F "$(host_entry_name)" -f "$KNOWN_HOSTS" >/dev/null 2>&1
+}
+
+# 抓取远端主机公钥（ssh-keyscan 不走认证，能安全地用于比对指纹）
+fetch_host_keys() {
+    command -v ssh-keyscan >/dev/null 2>&1 || return 1
+    ssh-keyscan -T "$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$SSH_HOST" 2>/dev/null \
+        | grep -v '^#' | grep -v '^[[:space:]]*$'
+}
+
+verify_host_key() {
+    local keys fps ans
+
+    if host_key_known; then
+        SSH_HOSTKEY_OPT="yes"
+        return 0
+    fi
+
+    if ! command -v ssh-keygen >/dev/null 2>&1 || ! command -v ssh-keyscan >/dev/null 2>&1; then
+        err "缺少 ssh-keygen / ssh-keyscan，无法核对主机指纹。"
+        err "请安装完整的 openssh-client 后重试。"
+        return 1
+    fi
+
+    printf '\n'
+    warn "首次连接 ${SSH_HOST}:${SSH_PORT}，需要确认远端主机密钥指纹。"
+    keys=$(fetch_host_keys)
+    if [[ -z $keys ]]; then
+        err "无法获取远端主机密钥（ssh-keyscan 失败，可能被防火墙拦截或端口不通）。"
+        err "为避免中间人攻击，脚本不会在未核对指纹的情况下继续。"
+        printf '  可先手动确认再重试：ssh-keyscan -p %s %s >> ~/.ssh/known_hosts\n' \
+            "$SSH_PORT" "$SSH_HOST"
+        return 1
+    fi
+
+    fps=$(printf '%s\n' "$keys" | ssh-keygen -lf - 2>/dev/null | awk '{printf "    %-14s %s\n", $4, $2}')
+    printf '  远端主机提供以下公钥：\n%s\n' "$fps"
+    info "请与服务器管理员核对 SHA-256 指纹；核对无误后再继续。"
+
+    while :; do
+        IFS= read -r -p "  是否信任该主机并写入 known_hosts？[y=信任 / n=取消]: " ans || return 1
+        case $ans in
+            y|Y) break ;;
+            n|N|"") err "已取消，未建立连接。"; return 1 ;;
+            *) err "无效输入「$ans」：只能输入单个字母 y 或 n。" ;;
+        esac
+    done
+
+    mkdir -p -- "$(dirname -- "$KNOWN_HOSTS")" 2>/dev/null || true
+    chmod 700 -- "$(dirname -- "$KNOWN_HOSTS")" 2>/dev/null || true
+    if ! printf '%s\n' "$keys" >> "$KNOWN_HOSTS"; then
+        err "写入 known_hosts 失败：$KNOWN_HOSTS"
+        return 1
+    fi
+    chmod 600 -- "$KNOWN_HOSTS" 2>/dev/null || true
+    SSH_HOSTKEY_OPT="yes"
+    ok "已记录主机密钥，后续连接将校验该指纹。"
+    return 0
 }
 
 # 把 ssh 的报错翻译成人话
@@ -540,7 +731,7 @@ diagnose_ssh_error() {
 
 #--------------------- 第一步：采集连接信息 ---------------------
 collect_ssh_info() {
-    local raw
+    local raw ans
 
     printf '\n%s---- 第 1 步：SSH 连接信息 ----%s\n' "$C_BLD" "$C_RST"
     printf '  输入格式：地址:端口\n'
@@ -564,34 +755,58 @@ collect_ssh_info() {
         SSH_PORT=$PORT_PART
         [[ -n $PARSE_NOTE ]] && info "$PARSE_NOTE"
         ok "远端地址：${SSH_HOST}（端口 ${SSH_PORT}）"
-        break
+
+        # 主机指纹在输入用户名 / 密码之前确认，未确认就不发任何凭证
+        if verify_host_key; then
+            break
+        fi
+        IFS= read -r -p "是否重新输入地址？[Y=重新输入 / q=退出]: " ans || exit 1
+        case ${ans:-Y} in
+            q|Q) err "已取消，退出。"; exit 1 ;;
+        esac
     done
 
-    ask_required "SSH 用户名: "
-    SSH_USER=$REPLY_VALUE
+    # 用户名只允许常规字符：它会被拼进 user@host，含空格或 @ 会让地址非法
+    while :; do
+        ask_required "SSH 用户名: "
+        if [[ $REPLY_VALUE =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]]; then
+            SSH_USER=$REPLY_VALUE
+            break
+        fi
+        err "用户名「$REPLY_VALUE」含非法字符：只允许字母、数字、点、下划线、连字符，且不能以 - 开头。"
+    done
+}
 
+# 采集密码（仅在密钥认证不可用时）
+ask_password() {
     while :; do
         IFS= read -r -s -p "SSH 密码（输入时不回显）: " SSH_PASS || { printf '\n'; err "输入已结束，退出。"; exit 1; }
         printf '\n'
         if [[ -n $SSH_PASS ]]; then
-            break
+            return 0
         fi
         err "密码不能为空，请重新输入。"
     done
 }
 
-# 尝试连接并校验密码
+# 尝试连接并验证当前认证方式是否可用；$1 = quiet 时不打印「正在连接」
 try_connect() {
     local out rc
-    : > "$TMP_ERR"
-
-    info "正在连接 ${SSH_USER}@${SSH_HOST}:${SSH_PORT} ……"
+    [[ ${1:-} == quiet ]] || info "正在连接 ${SSH_USER}@${SSH_HOST}:${SSH_PORT} ……"
     out=$(ssh_exec 'printf "__SSH_OK__\n"')
     rc=$?
+    (( rc == 0 )) && [[ $out == *__SSH_OK__* ]]
+}
 
-    if (( rc == 0 )) && [[ $out == *__SSH_OK__* ]]; then
+# 先试公钥 / ssh-agent：能用就不必采集密码，也不必准备密码注入后端
+try_key_auth() {
+    USE_KEY_AUTH=1
+    refresh_auth_opts
+    if try_connect quiet; then
         return 0
     fi
+    USE_KEY_AUTH=0
+    refresh_auth_opts
     return 1
 }
 
@@ -599,6 +814,15 @@ connect_loop() {
     local ans
     while :; do
         collect_ssh_info
+
+        if try_key_auth; then
+            ok "已通过公钥 / ssh-agent 免密登录，无需输入密码。"
+            return 0
+        fi
+
+        ensure_auth_backend
+        ask_password
+
         if try_connect; then
             ok "连接成功，密码校验通过。"
             return 0
@@ -763,16 +987,52 @@ choose_remote_dir() {
 
 #--------------------- 第四步：传输 ---------------------
 build_ssh_e() {
-    printf 'ssh -p %s -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR' "$SSH_PORT"
-    printf ' -o PreferredAuthentications=password,keyboard-interactive'
-    printf ' -o PubkeyAuthentication=no -o ConnectTimeout=%s' "$SSH_CONNECT_TIMEOUT"
+    local s
+    s="ssh -p $SSH_PORT -o StrictHostKeyChecking=${SSH_HOSTKEY_OPT:-accept-new} -o LogLevel=ERROR"
+    s+=" -o ConnectTimeout=$SSH_CONNECT_TIMEOUT"
+    # 弱网 / 半开连接下避免长时间挂住
+    s+=" -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+    if (( USE_KEY_AUTH == 1 )); then
+        s+=" -o BatchMode=yes -o PasswordAuthentication=no"
+    else
+        s+=" -o PreferredAuthentications=password,keyboard-interactive"
+        s+=" -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1"
+    fi
+    printf '%s' "$s"
 }
 
 # 远端是否可用 rsync
 check_remote_rsync() {
-    local out
+    local out rc
     out=$(ssh_exec 'command -v rsync >/dev/null 2>&1 && printf "__HAS_RSYNC__\n"')
-    [[ $out == *__HAS_RSYNC__* ]] && HAVE_RSYNC_REMOTE=1 || HAVE_RSYNC_REMOTE=0
+    rc=$?
+    if [[ $out == *__HAS_RSYNC__* ]]; then
+        HAVE_RSYNC_REMOTE=1
+        return 0
+    fi
+    HAVE_RSYNC_REMOTE=0
+    # 退出码 1 表示远端确实没装 rsync；其他值多为连接 / 认证异常，不能静默降级
+    if (( rc != 0 && rc != 1 )); then
+        warn "探测远端 rsync 失败（退出码 $rc：$(diagnose_ssh_error)），将改用其他传输方式。"
+        return 1
+    fi
+    return 0
+}
+
+# 远端路径能否安全地直接交给 scp：
+# OpenSSH 9.0 之前（或加 -O 时）scp 的远端路径由远端 shell 解析，
+# 含空格 / 通配符 / 命令替换等字符会被二次解释，这种情况改用 tar 管道。
+remote_path_is_scp_safe() {
+    case $1 in
+        -*|"")                            return 1 ;;
+        *[[:space:]]*)                    return 1 ;;
+        *'`'*|*'$'*|*';'*|*'&'*|*'|'*)    return 1 ;;
+        *'*'*|*'?'*|*'['*|*']'*)          return 1 ;;
+        *'<'*|*'>'*|*'!'*|*'~'*)          return 1 ;;
+        *"'"*|*'"'*|*'\'*)                return 1 ;;
+        *'('*|*')'*|*'{'*|*'}'*)          return 1 ;;
+    esac
+    return 0
 }
 
 # 远端 tar 是否为 GNU tar（决定「不覆盖」用哪个参数）
@@ -785,6 +1045,7 @@ remote_tar_is_gnu() {
 # tar 管道传输；$1 = pv（带 pv 进度）或 plain（无进度）
 tar_transfer() {
     local mode=$1 base rd_b64 total pv_args remote_tar_cmd x_opts rc
+    local -a pst
     base=$(basename -- "$LOCAL_ABS")
     rd_b64=$(to_b64 "$REMOTE_DIR")
 
@@ -811,12 +1072,17 @@ tar_transfer() {
         ( cd -- "$(dirname -- "$LOCAL_ABS")" && tar -cf - -- "$base" ) \
             | pv "${pv_args[@]}" \
             | ssh_exec "$remote_tar_cmd"
-        rc=${PIPESTATUS[2]}
+        pst=("${PIPESTATUS[@]}")
     else
         ( cd -- "$(dirname -- "$LOCAL_ABS")" && tar -cf - -- "$base" ) \
             | ssh_exec "$remote_tar_cmd"
-        rc=${PIPESTATUS[1]}
+        pst=("${PIPESTATUS[@]}")
     fi
+    # 三环（tar / pv / ssh）里任一环失败都算失败：只看最后一环会把
+    # 「本机 tar 读文件失败但远端正常收尾」误判成传输成功
+    rc=$(worst_rc "${pst[@]}")
+    TAR_RC_DETAIL=""
+    (( rc != 0 )) && TAR_RC_DETAIL="${pst[*]}"
     return "$rc"
 }
 
@@ -848,9 +1114,16 @@ do_transfer() {
     fi
 
     if (( HAVE_RSYNC_LOCAL == 1 && HAVE_RSYNC_REMOTE == 1 )); then
-        rsync_opts=(-a --partial --human-readable "$RSYNC_INFO_OPT" --stats -s)
+        # RSYNC_INFO_OPT 可能是空串（版本探测失败时），不能当成一个空参数传给 rsync，
+        # 否则 rsync 会把它当作一个空的源路径而直接报错
+        rsync_opts=(-a --human-readable --stats -s)
+        [[ -n $RSYNC_INFO_OPT ]] && rsync_opts+=("$RSYNC_INFO_OPT")
         if (( OVERWRITE == 0 )); then
-            rsync_opts+=(--ignore-existing)   # 跳过接收端已存在的文件
+            # --partial 会把中断残留的半截文件留在目标位置，配上 --ignore-existing
+            # 就被当成「已存在」永久跳过，坏文件再也修不回来；不覆盖模式下不用它
+            rsync_opts+=(--ignore-existing)
+        else
+            rsync_opts+=(--partial)
         fi
         info "传输方式：rsync（下方实时显示进度、当前速度与预计剩余时间）"
         printf '\n'
@@ -865,14 +1138,21 @@ do_transfer() {
         info "传输方式：tar + ssh（无进度显示）"
         tar_transfer plain
         rc=$?
+    elif ! remote_path_is_scp_safe "$REMOTE_DIR"; then
+        warn "远端路径含空格或特殊字符，scp 会把它交给远端 shell 解析，可能被二次解释。"
+        info "传输方式：tar + ssh（无进度显示，但路径经 base64 传递，不做 shell 解析）"
+        tar_transfer plain
+        rc=$?
     else
         warn "本机与远端都没有 rsync，且本机未安装 pv。"
         warn "改用 scp 传输，此方式无法显示实时速度与剩余时间。"
         printf '\n'
         pw_run scp -r -p -P "$SSH_PORT" \
-            -o StrictHostKeyChecking=accept-new \
-            -o PreferredAuthentications=password,keyboard-interactive \
-            -o PubkeyAuthentication=no \
+            -o "StrictHostKeyChecking=${SSH_HOSTKEY_OPT:-accept-new}" \
+            -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            "${SSH_AUTH_OPTS[@]}" \
             -o LogLevel=ERROR \
             -- "$LOCAL_ABS" "$dest"
         rc=$?
@@ -889,6 +1169,8 @@ do_transfer() {
         exit 1
     else
         err "传输失败，退出码 $rc。"
+        [[ -n ${TAR_RC_DETAIL:-} ]] && \
+            err "tar 管道各环节退出码：$TAR_RC_DETAIL（顺序为 tar / pv / ssh）"
         [[ -s $TMP_ERR ]] && sed -n '1,3p' "$TMP_ERR" | sed 's/^/    /' >&2
         err "已安全退出，本机文件未做任何修改。"
         exit 1
@@ -992,73 +1274,101 @@ HASH_COUNT_REMOTE=0
 HASH_DIFF=""
 HASH_MSG=""
 
-# 本机是否有可用的 SHA-256 工具
-have_local_hash_cmd() {
-    command -v sha256sum >/dev/null 2>&1 ||
-    command -v shasum    >/dev/null 2>&1 ||
-    command -v openssl   >/dev/null 2>&1
-}
-
-# 本机单文件 SHA-256（sha256sum → shasum -a 256 → openssl dgst）
-hash_file_local() {
+# 本机可用的 SHA-256 工具：启动时只探测一次，避免每个文件重复 command -v
+detect_local_hasher() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+        HASHER_LOCAL="sha256sum"
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+        HASHER_LOCAL="shasum"
+    elif command -v openssl >/dev/null 2>&1; then
+        HASHER_LOCAL="openssl"
     else
-        openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+        HASHER_LOCAL=""
+        return 1
     fi
+    return 0
 }
 
-# 对标准输入求 SHA-256
+# 对标准输入求 SHA-256（用于清单汇总值）
 hash_stream() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum | cut -d' ' -f1
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 | cut -d' ' -f1
-    else
-        openssl dgst -sha256 | awk '{print $NF}'
-    fi
+    case $HASHER_LOCAL in
+        sha256sum) sha256sum | cut -d' ' -f1 ;;
+        shasum)    shasum -a 256 | cut -d' ' -f1 ;;
+        openssl)   openssl dgst -sha256 | awk '{print $NF}' ;;
+        *)         return 1 ;;
+    esac
+}
+
+# 把各家的 `hash<分隔符>./path` 统一成 `hash  path`，让两侧清单逐字节可比。
+# 需要消化三种实现差异，任何一条漏掉都会变成「内容其实一致却报不一致」：
+#   1) GNU coreutils 遇到文件名含反斜杠/换行时，会在行首加 \ 做转义
+#   2) 二进制模式下哈希与路径之间是 " *"（星号），不是两个空格
+#   3) 路径前缀 ./ 需要去掉，使两侧相对路径同形
+manifest_clean() {
+    sed -e 's/^\\//' \
+        -e 's/^\([0-9a-fA-F]\{64\}\)[[:space:]][[:space:]]*[*]\{0,1\}/\1  /' \
+        -e 's/^\([0-9a-fA-F]\{64\}\)  \.\//\1  /'
 }
 
 # 生成「哈希  相对路径」清单（按路径排序，保证两侧可比）
+# 用 find -exec ... + 批量调用，避免每个文件 fork 一次哈希进程
 local_manifest() {
     local f h
-    (
-        cd -- "$LOCAL_ABS" 2>/dev/null || exit 1
-        # 用 ./ 前缀遍历，避免文件名以 - 开头被当成参数
-        find . -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
-            h=$(hash_file_local "$f") || exit 1
-            printf '%s  %s\n' "$h" "${f#./}"
-        done
-    ) | LC_ALL=C sort -k2
+    case $HASHER_LOCAL in
+        sha256sum)
+            ( cd -- "$LOCAL_ABS" 2>/dev/null || exit 1
+              find . -type f -exec sha256sum {} + 2>/dev/null | manifest_clean
+            ) | LC_ALL=C sort -k2
+            ;;
+        shasum)
+            ( cd -- "$LOCAL_ABS" 2>/dev/null || exit 1
+              find . -type f -exec shasum -a 256 {} + 2>/dev/null | manifest_clean
+            ) | LC_ALL=C sort -k2
+            ;;
+        openssl)
+            # openssl 没有批量模式，只能逐文件；路径来自 find，带 ./ 前缀
+            ( cd -- "$LOCAL_ABS" 2>/dev/null || exit 1
+              find . -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+                  h=$(openssl dgst -sha256 "$f" 2>/dev/null | sed 's/.*= //')
+                  [[ -n $h ]] || exit 1
+                  printf '%s  %s\n' "$h" "${f#./}"
+              done
+            ) | LC_ALL=C sort -k2
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
-# 在远端生成同样的清单；路径经 base64 传递，避免二次解释
+# 在远端生成同样的清单；路径经 base64 传递，避免二次解释。
+# 远端刻意只用 POSIX sh 语法：ssh 用远端登录 shell 执行命令，
+# dash / busybox ash 不支持 bash 的 read -d、数组与 [[ ]]，写了就必然失败。
 remote_manifest() {
     local b64
     b64=$(to_b64 "$FINAL_DIR")
     ssh_exec "B64='$b64'
 d=\$(printf '%s' \"\$B64\" | base64 -d) || { echo __BADB64__; exit 9; }
 cd -- \"\$d\" 2>/dev/null || { echo __NODIR__; exit 8; }
-if   command -v sha256sum >/dev/null 2>&1; then HM=sum
-elif command -v shasum    >/dev/null 2>&1; then HM=shasum
-elif command -v openssl   >/dev/null 2>&1; then HM=openssl
-else echo __NOHASH__; exit 7; fi
-find . -type f -print0 | while IFS= read -r -d '' f; do
-    case \$HM in
-        sum)     h=\$(sha256sum \"\$f\" | cut -d' ' -f1) ;;
-        shasum)  h=\$(shasum -a 256 \"\$f\" | cut -d' ' -f1) ;;
-        openssl) h=\$(openssl dgst -sha256 \"\$f\" | awk '{print \$NF}') ;;
-    esac
-    printf '%s  %s\n' \"\$h\" \"\${f#./}\"
-done | LC_ALL=C sort -k2"
+if command -v sha256sum >/dev/null 2>&1; then
+    find . -type f -exec sha256sum {} + 2>/dev/null
+elif command -v shasum >/dev/null 2>&1; then
+    find . -type f -exec shasum -a 256 {} + 2>/dev/null
+elif command -v openssl >/dev/null 2>&1; then
+    find . -type f | while IFS= read -r f; do
+        h=\$(openssl dgst -sha256 \"\$f\" 2>/dev/null | sed 's/.*= //')
+        if [ -z \"\$h\" ]; then echo __HASHFAIL__; exit 1; fi
+        printf '%s  %s\n' \"\$h\" \"\${f#./}\"
+    done
+else
+    echo __NOHASH__; exit 7
+fi" | manifest_clean | LC_ALL=C sort -k2
 }
 
 do_hash_verify() {
-    local lm rm
+    local rrc
 
-    if ! have_local_hash_cmd; then
+    if [[ -z $HASHER_LOCAL ]]; then
         HASH_STATUS="ERROR"
         HASH_MSG="本机没有 sha256sum / shasum / openssl，无法计算 HASH。"
         err "$HASH_MSG"
@@ -1066,8 +1376,14 @@ do_hash_verify() {
     fi
 
     info "正在计算本机源目录的 HASH ……"
-    lm=$(local_manifest)
-    if [[ -z $lm ]]; then
+    # 清单落到临时文件，避免十万级文件时整份列表驻留内存
+    if ! local_manifest > "$TMP_MAN_L"; then
+        HASH_STATUS="ERROR"
+        HASH_MSG="计算本机清单失败：有文件读不出来，或目录不可访问。"
+        err "$HASH_MSG"
+        return 0
+    fi
+    if [[ ! -s $TMP_MAN_L ]]; then
         HASH_STATUS="ERROR"
         HASH_MSG="本机源目录内没有普通文件（空目录无法比对）。"
         err "$HASH_MSG"
@@ -1075,38 +1391,54 @@ do_hash_verify() {
     fi
 
     info "正在计算远端目标目录的 HASH ……"
-    rm=$(remote_manifest)
-    case $rm in
-        *__NOHASH__*)
-            HASH_STATUS="ERROR"
-            HASH_MSG="远端缺少 sha256sum / shasum / openssl，无法计算 HASH。"
-            err "$HASH_MSG"; return 0 ;;
-        *__NODIR__*)
-            HASH_STATUS="ERROR"
-            HASH_MSG="远端目标目录不存在或无法进入：$FINAL_DIR"
-            err "$HASH_MSG"; return 0 ;;
-        *__BADB64__*)
-            HASH_STATUS="ERROR"
-            HASH_MSG="远端缺少 base64，无法安全传递目录名。"
-            err "$HASH_MSG"; return 0 ;;
-    esac
-    if [[ -z $rm ]]; then
+    remote_manifest > "$TMP_MAN_R"
+    rrc=$?
+
+    # 远端用哨兵值报告具体原因，先按哨兵判断，再看退出码
+    if grep -qx '__NOHASH__' "$TMP_MAN_R"; then
+        HASH_STATUS="ERROR"; HASH_MSG="远端缺少 sha256sum / shasum / openssl，无法计算 HASH。"
+        err "$HASH_MSG"; return 0
+    fi
+    if grep -qx '__NODIR__' "$TMP_MAN_R"; then
+        HASH_STATUS="ERROR"; HASH_MSG="远端目标目录不存在或无法进入：$FINAL_DIR"
+        err "$HASH_MSG"; return 0
+    fi
+    if grep -qx '__BADB64__' "$TMP_MAN_R"; then
+        HASH_STATUS="ERROR"; HASH_MSG="远端缺少 base64，无法安全传递目录名。"
+        err "$HASH_MSG"; return 0
+    fi
+    if grep -qx '__HASHFAIL__' "$TMP_MAN_R"; then
+        HASH_STATUS="ERROR"; HASH_MSG="远端有文件读不出来，清单不完整。"
+        err "$HASH_MSG"; return 0
+    fi
+    if (( rrc != 0 )); then
         HASH_STATUS="ERROR"
-        HASH_MSG="远端目标目录内没有普通文件。"
+        HASH_MSG="远端清单生成失败（退出码 $rrc）：$(diagnose_ssh_error)"
         err "$HASH_MSG"
         return 0
     fi
+    if [[ ! -s $TMP_MAN_R ]]; then
+        HASH_STATUS="ERROR"; HASH_MSG="远端目标目录内没有普通文件。"
+        err "$HASH_MSG"; return 0
+    fi
 
-    HASH_COUNT_LOCAL=$(printf '%s\n' "$lm" | grep -c .)
-    HASH_COUNT_REMOTE=$(printf '%s\n' "$rm" | grep -c .)
-    HASH_LOCAL=$(printf '%s\n' "$lm" | hash_stream)
-    HASH_REMOTE=$(printf '%s\n' "$rm" | hash_stream)
+    HASH_COUNT_LOCAL=$(grep -c . "$TMP_MAN_L")
+    HASH_COUNT_REMOTE=$(grep -c . "$TMP_MAN_R")
+    HASH_LOCAL=$(hash_stream < "$TMP_MAN_L")
+    HASH_REMOTE=$(hash_stream < "$TMP_MAN_R")
+    # 两侧都算不出汇总值时不能直接比较：两个空串相等会被误判成「一致」
+    if [[ -z $HASH_LOCAL || -z $HASH_REMOTE ]]; then
+        HASH_STATUS="ERROR"
+        HASH_MSG="汇总值计算失败：本机 SHA-256 工具不可用（HASHER_LOCAL=${HASHER_LOCAL:-无}）。"
+        err "$HASH_MSG"
+        return 0
+    fi
 
     if [[ $HASH_LOCAL == "$HASH_REMOTE" ]]; then
         HASH_STATUS="SAME"
     else
         HASH_STATUS="DIFF"
-        HASH_DIFF=$(diff <(printf '%s\n' "$lm") <(printf '%s\n' "$rm") 2>/dev/null | head -n 30)
+        HASH_DIFF=$(diff "$TMP_MAN_L" "$TMP_MAN_R" 2>/dev/null | head -n 30)
     fi
     return 0
 }
@@ -1119,11 +1451,11 @@ ask_hash_verify() {
     while :; do
         IFS= read -r -p "是否执行 HASH 校验？[Y=执行 / n=跳过]: " ans ||
             { printf '\n'; HASH_STATUS="SKIPPED"; return 0; }
-        ans=$(trim "$ans")
+        # 与覆盖询问保持一致：只认单个字母，" y " 这种带空格的也算无效
         case $ans in
             ""|y|Y) do_hash_verify; return 0 ;;
             n|N)    HASH_STATUS="SKIPPED"; info "已跳过 HASH 校验。"; return 0 ;;
-            *)      err "无效输入「$ans」：请输入 y 执行校验，或 n 跳过（直接回车默认执行）。" ;;
+            *)      err "无效输入「$ans」：请输入单个字母 y 执行校验，或 n 跳过（直接回车默认执行）。" ;;
         esac
     done
 }
@@ -1139,9 +1471,13 @@ main() {
     do_transfer
     ask_hash_verify
     print_summary
-    # HASH 不一致视为校验失败：汇总已打印，用独立退出码告知调用者
+    # HASH 校验结果用独立退出码告知调用者：
+    # 2 = 内容不一致；3 = 校验没能完成（既不能算通过，也不该算一致）
     if [[ $HASH_STATUS == "DIFF" ]]; then
         exit 2
+    fi
+    if [[ $HASH_STATUS == "ERROR" ]]; then
+        exit 3
     fi
     return 0
 }
